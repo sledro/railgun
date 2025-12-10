@@ -21,7 +21,7 @@ Railgun is a command-line tool designed to stress test Ethereum-compatible netwo
 
 ## Requirements
 
-- Go 1.24.2 or later
+- Go 1.25.1 or later
 - Access to an Ethereum-compatible RPC endpoint
 - A funded wallet (default: Foundry test mnemonic)
 
