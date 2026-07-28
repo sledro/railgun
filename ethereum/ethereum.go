@@ -2,19 +2,27 @@ package ethereum
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	gethereum "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/rpc"
 )
+
+// batchCallTimeout bounds a single batch RPC round trip.
+const batchCallTimeout = 30 * time.Second
+
+// nonceProbeDelay spaces out nonce probes so a load balancer is likely to route
+// them to different backend nodes.
+const nonceProbeDelay = 50 * time.Millisecond
 
 type Ethereum struct {
 	Client      *ethclient.Client
@@ -38,8 +46,8 @@ func NewEthereum(cfg *Config) *Ethereum {
 	}
 }
 
-func (e *Ethereum) Connect() error {
-	ethClient, err := ethclient.Dial(e.cfg.URL)
+func (e *Ethereum) Connect(ctx context.Context) error {
+	ethClient, err := ethclient.DialContext(ctx, e.cfg.URL)
 	if err != nil {
 		return err
 	}
@@ -54,32 +62,85 @@ func (e *Ethereum) Close() {
 	}
 }
 
-func (e *Ethereum) GetNonce(address common.Address) (uint64, error) {
-	nonce, err := e.Client.PendingNonceAt(context.Background(), address)
-	if err != nil {
-		return 0, err
-	}
-	return nonce, nil
+// IsNotFound reports whether err means the node does not have the requested
+// block, transaction or receipt. Prefer this over matching on error strings.
+func IsNotFound(err error) bool {
+	return errors.Is(err, gethereum.NotFound)
 }
 
-func (e *Ethereum) GetGasPrice() (*big.Int, error) {
-	gasPrice, err := e.Client.SuggestGasPrice(context.Background())
-	if err != nil {
-		return nil, err
+// GetHighestPendingNonce probes the pending nonce several times and returns the
+// highest value seen. Load-balanced RPCs can route each call to a different node
+// with a different view of the mempool, and the highest nonce is the only safe
+// choice: starting below it would collide with transactions already pending.
+//
+// Individual probe failures are tolerated; an error is returned only if every
+// probe fails. attempts is clamped to at least 1.
+func (e *Ethereum) GetHighestPendingNonce(ctx context.Context, address common.Address, attempts int) (uint64, error) {
+	if attempts < 1 {
+		attempts = 1
 	}
-	return gasPrice, nil
+
+	var (
+		maxNonce   uint64
+		lastErr    error
+		anySucceed bool
+	)
+
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			if err := sleepCtx(ctx, nonceProbeDelay); err != nil {
+				break
+			}
+		}
+
+		nonce, err := e.Client.PendingNonceAt(ctx, address)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		anySucceed = true
+		if nonce > maxNonce {
+			maxNonce = nonce
+		}
+	}
+
+	if !anySucceed {
+		return 0, fmt.Errorf("failed to fetch pending nonce for %s after %d attempt(s): %w", address.Hex(), attempts, lastErr)
+	}
+
+	return maxNonce, nil
 }
 
-func (e *Ethereum) GetChainID() (*big.Int, error) {
-	chainID, err := e.Client.ChainID(context.Background())
+// sleepCtx sleeps for d, returning early with ctx.Err() if ctx is cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// SleepCtx sleeps for d, returning early with ctx.Err() if ctx is cancelled.
+// Exported so callers pacing their own work stay interruptible.
+func SleepCtx(ctx context.Context, d time.Duration) error {
+	return sleepCtx(ctx, d)
+}
+
+func (e *Ethereum) GetChainID(ctx context.Context) (*big.Int, error) {
+	chainID, err := e.Client.ChainID(ctx)
 	if err != nil {
 		return nil, err
 	}
 	return chainID, nil
 }
 
-func (e *Ethereum) GetBlockNumber() (uint64, error) {
-	blockNumber, err := e.Client.BlockNumber(context.Background())
+func (e *Ethereum) GetBlockNumber(ctx context.Context) (uint64, error) {
+	blockNumber, err := e.Client.BlockNumber(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -91,17 +152,12 @@ func (e *Ethereum) GetClient() *ethclient.Client {
 	return e.Client
 }
 
-// WaitMined waits for a transaction to be mined
-func (e *Ethereum) WaitMined(ctx context.Context, tx *types.Transaction) (*types.Receipt, error) {
-	return bind.WaitMined(ctx, e.Client, tx)
-}
-
 // SendBatch sends a batch of transactions in a single RPC call.
 // It returns a slice of rpc.BatchElem, where each element corresponds to an input transaction
 // and contains either the transaction hash in its Result field or an error in its Error field.
 // The second return value is the network time (excluding marshaling).
 // The third return value is an error for the overall BatchCall operation itself.
-func (e *Ethereum) SendBatch(inputBatch []*types.Transaction) ([]rpc.BatchElem, time.Duration, error) {
+func (e *Ethereum) SendBatch(ctx context.Context, inputBatch []*types.Transaction) ([]rpc.BatchElem, time.Duration, error) {
 	if len(inputBatch) == 0 {
 		return nil, 0, nil // Nothing to send, no error
 	}
@@ -129,61 +185,51 @@ func (e *Ethereum) SendBatch(inputBatch []*types.Transaction) ([]rpc.BatchElem, 
 		}
 	}
 
-	// Use a context with timeout to prevent hanging indefinitely
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Bound the call so a stalled endpoint cannot hang the run indefinitely
+	callCtx, cancel := context.WithTimeout(ctx, batchCallTimeout)
 	defer cancel()
 
 	// Time ONLY the actual network submission (excluding marshaling)
 	networkStart := time.Now()
-	err := e.Client.Client().BatchCallContext(ctx, rpcBatch)
+	err := e.Client.Client().BatchCallContext(callCtx, rpcBatch)
 	networkTime := time.Since(networkStart)
 
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return rpcBatch, networkTime, fmt.Errorf("batch call timed out after 30s (rpc: %s, batch size: %d)", e.cfg.URL, len(inputBatch))
+		if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+			return rpcBatch, networkTime, fmt.Errorf("batch call timed out after %s (rpc: %s, batch size: %d)", batchCallTimeout, e.cfg.URL, len(inputBatch))
 		}
-		return rpcBatch, networkTime, fmt.Errorf("batch call failed (rpc: %s, batch size: %d): %v", e.cfg.URL, len(inputBatch), err)
+		return rpcBatch, networkTime, fmt.Errorf("batch call failed (rpc: %s, batch size: %d): %w", e.cfg.URL, len(inputBatch), err)
 	}
 
 	// The rpcBatch slice is now populated with results or errors for each element.
 	return rpcBatch, networkTime, nil
 }
 
-// SendTransaction sends a single transaction
-func (e *Ethereum) SendTransaction(tx *types.Transaction) error {
-	return e.Client.SendTransaction(context.Background(), tx)
-}
-
-// GetLatestBlockNumber returns the latest block number
-func (e *Ethereum) GetLatestBlockNumber() (uint64, error) {
-	return e.Client.BlockNumber(context.Background())
-}
-
 // GetBlockByNumber returns a block by its number
-func (e *Ethereum) GetBlockByNumber(blockNum uint64) (*types.Block, error) {
-	return e.Client.BlockByNumber(context.Background(), big.NewInt(int64(blockNum)))
+func (e *Ethereum) GetBlockByNumber(ctx context.Context, blockNum uint64) (*types.Block, error) {
+	return e.Client.BlockByNumber(ctx, new(big.Int).SetUint64(blockNum))
 }
 
 // GetBlockHeaderByNumber returns only the block header by its number (without transactions)
 // This is useful for forks with custom transaction types
-func (e *Ethereum) GetBlockHeaderByNumber(blockNum uint64) (*types.Header, error) {
-	return e.Client.HeaderByNumber(context.Background(), big.NewInt(int64(blockNum)))
+func (e *Ethereum) GetBlockHeaderByNumber(ctx context.Context, blockNum uint64) (*types.Header, error) {
+	return e.Client.HeaderByNumber(ctx, new(big.Int).SetUint64(blockNum))
 }
 
 // GetBlockTransactionCount returns the number of transactions in a block without decoding them
 // This is useful for chains with custom transaction types
-func (e *Ethereum) GetBlockTransactionCount(blockNum uint64) (int, error) {
+func (e *Ethereum) GetBlockTransactionCount(ctx context.Context, blockNum uint64) (int, error) {
 	// Get the underlying RPC client
 	rpcClient := e.Client.Client()
 
 	// Make raw RPC call to get block with transaction hashes only (not full transactions)
 	type blockResult struct {
-		Transactions []interface{} `json:"transactions"`
+		Transactions []any `json:"transactions"`
 	}
 
 	var result blockResult
 	err := rpcClient.CallContext(
-		context.Background(),
+		ctx,
 		&result,
 		"eth_getBlockByNumber",
 		fmt.Sprintf("0x%x", blockNum),
@@ -196,14 +242,9 @@ func (e *Ethereum) GetBlockTransactionCount(blockNum uint64) (int, error) {
 	return len(result.Transactions), nil
 }
 
-// GetTransactionReceipt returns the receipt for a transaction
-func (e *Ethereum) GetTransactionReceipt(txHash common.Hash) (*types.Receipt, error) {
-	return e.Client.TransactionReceipt(context.Background(), txHash)
-}
-
 // BatchGetTransactionReceipts fetches multiple transaction receipts in parallel batches
 // with adaptive batch sizes based on connection type (WebSocket vs HTTP)
-func (e *Ethereum) BatchGetTransactionReceipts(txHashes []common.Hash) (map[common.Hash]*types.Receipt, error) {
+func (e *Ethereum) BatchGetTransactionReceipts(ctx context.Context, txHashes []common.Hash) (map[common.Hash]*types.Receipt, error) {
 	if len(txHashes) == 0 {
 		return make(map[common.Hash]*types.Receipt), nil
 	}
@@ -228,18 +269,19 @@ func (e *Ethereum) BatchGetTransactionReceipts(txHashes []common.Hash) (map[comm
 
 	// Process batches in parallel
 	for i := 0; i < len(txHashes); i += batchSize {
-		end := i + batchSize
-		if end > len(txHashes) {
-			end = len(txHashes)
-		}
+		end := min(i+batchSize, len(txHashes))
 
 		wg.Add(1)
 		go func(batch []common.Hash) {
 			defer wg.Done()
 
 			// Acquire semaphore slot
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				return
+			}
 
 			// Prepare batch RPC call
 			rpcBatch := make([]rpc.BatchElem, len(batch))
@@ -252,8 +294,10 @@ func (e *Ethereum) BatchGetTransactionReceipts(txHashes []common.Hash) (map[comm
 			}
 
 			// Execute batch call
-			err := e.Client.Client().BatchCall(rpcBatch)
-			if err != nil {
+			callCtx, cancel := context.WithTimeout(ctx, batchCallTimeout)
+			defer cancel()
+
+			if err := e.Client.Client().BatchCallContext(callCtx, rpcBatch); err != nil {
 				select {
 				case errChan <- fmt.Errorf("batch receipt call failed (rpc: %s, batch size: %d): %w", e.cfg.URL, len(batch), err):
 				default:

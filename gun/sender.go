@@ -1,6 +1,7 @@
-package railgun
+package gun
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -21,10 +22,15 @@ type TransactionSender struct {
 
 // SendResult contains the results of sending batches
 type SendResult struct {
-	TxHashes    []common.Hash
-	Failed      int
-	Success     int
-	NetworkTime time.Duration // Time spent in actual network submission (excluding marshaling)
+	TxHashes []common.Hash
+	Failed   int
+	Success  int
+	// NetworkTime is the sum of per-batch RPC durations. In parallel mode
+	// batches overlap, so this exceeds WallTime and must not be used as an
+	// elapsed time. Use WallTime for any rate calculation.
+	NetworkTime time.Duration
+	// WallTime is the wall-clock duration of the whole send phase.
+	WallTime time.Duration
 }
 
 // NewTransactionSender creates a new transaction sender
@@ -36,19 +42,27 @@ func NewTransactionSender(eth *ethereum.Ethereum, log *slog.Logger, concurrency 
 	}
 }
 
-// SendBatches sends multiple batches of transactions with sequential or parallel mode
-func (s *TransactionSender) SendBatches(batches [][]*types.Transaction, batchDelay int64, startTime time.Time) *SendResult {
-	// If concurrency is 1, use sequential mode with delays between completions
+// SendBatches sends multiple batches of transactions with sequential or parallel mode.
+// The batch schedule is anchored to the start of the send phase, so both modes
+// pace batches identically regardless of how long earlier phases took.
+func (s *TransactionSender) SendBatches(ctx context.Context, batches [][]*types.Transaction, batchDelay int64) *SendResult {
+	sendStart := time.Now()
+
+	var result *SendResult
 	if s.concurrency == 1 {
-		return s.sendBatchesSequential(batches, batchDelay)
+		// Sequential mode with delays between completions
+		result = s.sendBatchesSequential(ctx, batches, batchDelay, sendStart)
+	} else {
+		// Parallel mode with scheduled times
+		result = s.sendBatchesParallel(ctx, batches, batchDelay, sendStart)
 	}
 
-	// Otherwise use parallel mode with scheduled times
-	return s.sendBatchesParallel(batches, batchDelay, startTime)
+	result.WallTime = time.Since(sendStart)
+	return result
 }
 
 // sendBatchesSequential sends batches one at a time with scheduled timing
-func (s *TransactionSender) sendBatchesSequential(batches [][]*types.Transaction, batchDelay int64) *SendResult {
+func (s *TransactionSender) sendBatchesSequential(ctx context.Context, batches [][]*types.Transaction, batchDelay int64, startTime time.Time) *SendResult {
 	result := &SendResult{
 		TxHashes: make([]common.Hash, 0),
 	}
@@ -57,22 +71,28 @@ func (s *TransactionSender) sendBatchesSequential(batches [][]*types.Transaction
 	var totalNetworkTime time.Duration
 
 	totalBatches := len(batches)
-	startTime := time.Now()
 
 	for i, batch := range batches {
+		if ctx.Err() != nil {
+			s.log.Warn("Send cancelled", "sentBatches", i, "totalBatches", totalBatches)
+			break
+		}
+
 		// Calculate when this batch should be sent
 		if batchDelay > 0 && i > 0 {
 			targetTime := startTime.Add(time.Duration(int64(i)*batchDelay) * time.Millisecond)
-			sleepDuration := time.Until(targetTime)
-			if sleepDuration > 0 {
-				time.Sleep(sleepDuration)
+			if sleepDuration := time.Until(targetTime); sleepDuration > 0 {
+				if err := ethereum.SleepCtx(ctx, sleepDuration); err != nil {
+					s.log.Warn("Send cancelled while pacing", "sentBatches", i, "totalBatches", totalBatches)
+					break
+				}
 			}
 		}
 
 		s.log.Info("Sending batch", "batch", i+1, "total", totalBatches, "size", len(batch))
 
 		// Send the batch
-		successHashes, success, failed, networkTime := s.sendSingleBatch(batch)
+		successHashes, success, failed, networkTime := s.sendSingleBatch(ctx, batch)
 		successCount += success
 		failedCount += failed
 		totalNetworkTime += networkTime
@@ -95,7 +115,7 @@ func (s *TransactionSender) sendBatchesSequential(batches [][]*types.Transaction
 }
 
 // sendBatchesParallel sends multiple batches of transactions concurrently with scheduled timing
-func (s *TransactionSender) sendBatchesParallel(batches [][]*types.Transaction, batchDelay int64, startTime time.Time) *SendResult {
+func (s *TransactionSender) sendBatchesParallel(ctx context.Context, batches [][]*types.Transaction, batchDelay int64, startTime time.Time) *SendResult {
 	result := &SendResult{
 		TxHashes: make([]common.Hash, 0),
 	}
@@ -115,23 +135,34 @@ func (s *TransactionSender) sendBatchesParallel(batches [][]*types.Transaction, 
 		go func(batchNum int, b []*types.Transaction) {
 			defer wg.Done()
 
-			// Acquire semaphore (limit concurrency)
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			// Calculate when this batch should be sent
+			// Wait for this batch's scheduled time BEFORE taking a concurrency
+			// slot. Acquiring first would let a batch scheduled far in the
+			// future hold a slot while sleeping, starving batches already due.
 			if batchDelay > 0 {
 				targetTime := startTime.Add(time.Duration(int64(batchNum)*batchDelay) * time.Millisecond)
-				sleepDuration := time.Until(targetTime)
-				if sleepDuration > 0 {
-					time.Sleep(sleepDuration)
+				if sleepDuration := time.Until(targetTime); sleepDuration > 0 {
+					if err := ethereum.SleepCtx(ctx, sleepDuration); err != nil {
+						return
+					}
 				}
+			}
+
+			// Acquire semaphore (limit concurrency)
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				return
+			}
+
+			if ctx.Err() != nil {
+				return
 			}
 
 			s.log.Info("Sending batch", "batch", batchNum+1, "total", totalBatches, "size", len(b))
 
 			// Send the batch and get back successful hashes
-			successHashes, success, failed, networkTime := s.sendSingleBatch(b)
+			successHashes, success, failed, networkTime := s.sendSingleBatch(ctx, b)
 			successCount.Add(int32(success))
 			failedCount.Add(int32(failed))
 			totalNetworkTime.Add(networkTime.Nanoseconds())
@@ -160,7 +191,7 @@ func (s *TransactionSender) sendBatchesParallel(batches [][]*types.Transaction, 
 }
 
 // sendSingleBatch sends a single batch and returns successful hashes, success/failure counts and network time
-func (s *TransactionSender) sendSingleBatch(batch []*types.Transaction) (successHashes []common.Hash, success int, failed int, networkTime time.Duration) {
+func (s *TransactionSender) sendSingleBatch(ctx context.Context, batch []*types.Transaction) (successHashes []common.Hash, success int, failed int, networkTime time.Duration) {
 	successHashes = make([]common.Hash, 0)
 
 	s.log.Debug("Preparing to send batch via RPC", "size", len(batch))
@@ -180,7 +211,7 @@ func (s *TransactionSender) sendSingleBatch(batch []*types.Transaction) (success
 	}
 
 	s.log.Debug("Calling eth.SendBatch", "batchSize", len(batch))
-	results, netTime, err := s.eth.SendBatch(batch)
+	results, netTime, err := s.eth.SendBatch(ctx, batch)
 	s.log.Debug("eth.SendBatch returned", "networkTime", netTime, "hasError", err != nil)
 
 	if err != nil {

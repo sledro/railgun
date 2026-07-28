@@ -1,2 +1,8 @@
-/.DS_Store
-railgun/.DS_Store
+.DS_Store
+
+# Benchmark reports written by `railgun tps` (see --reportDir)
+reports/
+
+# Build output: `go build .` writes the binary to the module root
+/railgun
+bin/

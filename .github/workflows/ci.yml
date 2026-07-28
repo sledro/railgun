@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Test with race detector
+        run: go test -race ./...
+
+  integration:
+    name: Integration against anvil
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Start anvil
+        run: |
+          anvil --port 8545 --block-time 1 > anvil.log 2>&1 &
+          for i in $(seq 1 30); do
+            if cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "anvil did not become ready"
+          cat anvil.log
+          exit 1
+
+      - name: Run tests against a live chain
+        env:
+          RAILGUN_TEST_RPC: http://127.0.0.1:8545
+        run: go test ./... -v
+
+      - name: Benchmark smoke test
+        run: |
+          go build
+          # Single-account sequential
+          ./railgun tps -r http://127.0.0.1:8545 -t 50 -b 10
+          # Multi-account parallel, exercising prefunding and the send scheduler
+          ./railgun tps -r http://127.0.0.1:8545 -t 100 -b 20 -c 4 -d 20 -a 4
